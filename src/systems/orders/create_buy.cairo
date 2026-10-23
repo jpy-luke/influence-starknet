@@ -154,12 +154,27 @@ mod CreateBuyOrder {
             caller_crew, exchange, order_types::LIMIT_BUY, product, price, storage, storage_slot
         );
 
-        components::set::<Order>(order_path, Order {
+        let mut new_order_data = Order {
             status: order_statuses::OPEN,
             amount: amount,
             valid_time: valid_time,
             maker_fee: maker_fee
-        });
+        };
+
+        // If order already exists and is open, add to it, otherwise create it
+        match components::get::<Order>(order_path) {
+            Option::Some(existing_order_data) => {
+                if existing_order_data.status == order_statuses::OPEN {
+                    // The existing deposit was escrowed at the existing order's fee, so
+                    // growth must use the same fee to keep the escrow balance reconcilable
+                    assert(existing_order_data.maker_fee == maker_fee, 'maker fee changed');
+                    new_order_data.amount += existing_order_data.amount;
+                }
+            },
+            Option::None(_) => ()
+        };
+
+        components::set::<Order>(order_path, new_order_data);
 
         self.emit(BuyOrderCreated {
             exchange: exchange,
@@ -275,36 +290,48 @@ mod tests {
 
     #[test]
     #[available_gas(100000000)]
-    fn test_redeposit_replaces_order_and_strands_escrow() {
+    fn test_redeposit_grows_order() {
         let (crew, market, destination) = setup();
         let mut state = CreateBuyOrder::contract_state_for_testing();
 
-        // Known defect, characterized here: redepositing for an existing open buy order does
-        // not grow it. The order component is keyed by (crew, exchange, type, product,
-        // price, storage, slot), so the second placement replaces the first, while the
-        // escrow pools both deposits under the same order id (caller, token, hook). Fills
-        // and cancels only ever pay out against the replaced amount, so the first deposit
-        // becomes unreachable without a 7-day forced withdrawal that also drains the live
-        // order.
+        // Regression test: redepositing for an existing open buy order must grow it, not
+        // replace it. The order component is keyed by (crew, exchange, type, product,
+        // price, storage, slot) and the escrow pools both deposits under the same order id
+        // (caller, token, hook), so a replacement would strand the first deposit.
         let deposit1 = place_buy_order(ref state, crew, market, destination, 1000, 200);
         let deposit2 = place_buy_order(ref state, crew, market, destination, 500, 200);
 
         let path = order_path_of(crew, market, destination);
         let order_data = components::get::<Order>(path).unwrap();
         assert(order_data.status == order_statuses::OPEN, 'wrong status');
-        assert(order_data.amount == 500, 'order was not replaced');
+        assert(order_data.amount == 1500, 'order was not grown');
+        assert(order_data.maker_fee == 200, 'wrong maker fee');
 
-        // Both placements are counted as separate orders by the exchange
+        // Quirk: each placement is still counted as a separate order by the exchange
         assert(components::get::<Exchange>(market.path()).unwrap().orders == 2, 'wrong order count');
 
-        // Reservations accumulate for both placements, but only the replacement order's
-        // amount (500) can ever be unreserved by fills and cancels
+        // Reservations accumulate for both placements, matching the grown amount
         assert(reserved_mass_of(destination) == 1500 * 1000, 'wrong reserved mass');
 
-        // The pooled escrow deposits exceed the replacement order's required deposit; the
-        // difference is stranded
-        let (required, _) = required_deposit(500, 200, FixedTrait::ONE(), FixedTrait::ONE());
-        assert(deposit1 + deposit2 - required == 1020, 'wrong stranded deposit');
+        // The pooled escrow deposits exactly cover the grown order's required deposit
+        let (grown_deposit, _) = required_deposit(1500, 200, FixedTrait::ONE(), FixedTrait::ONE());
+        assert(deposit1 + deposit2 == grown_deposit, 'escrow does not cover order');
+    }
+
+    #[test]
+    #[should_panic(expected: ('maker fee changed', ))]
+    #[available_gas(100000000)]
+    fn test_redeposit_rejects_changed_maker_fee() {
+        let (crew, market, destination) = setup();
+        let mut state = CreateBuyOrder::contract_state_for_testing();
+
+        // The existing deposit was escrowed at the fee computed for the crew at placement
+        // time; growing with a different fee would leave the pooled escrow unreconcilable,
+        // so growth is rejected and the player must cancel and recreate the order
+        place_buy_order(ref state, crew, market, destination, 1000, 200);
+        mocks::crewmate_with(1, classes::MERCHANT, 0, array![].span());
+
+        place_buy_order(ref state, crew, market, destination, 500, 100);
     }
 
     #[test]
@@ -324,10 +351,9 @@ mod tests {
         place_buy_order(ref state, crew, market, destination, 250, 200);
         assert(components::get::<Exchange>(market.path()).unwrap().orders == 3, 'wrong order count');
 
-        // Despite the count of 3, only a single order component exists, holding only the
-        // last placement's amount
+        // The placements accumulate into a single order component
         let order_data = components::get::<Order>(order_path_of(crew, market, destination)).unwrap();
-        assert(order_data.amount == 250, 'order was not replaced');
+        assert(order_data.amount == 1750, 'wrong amount');
     }
 
     #[test]
